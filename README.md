@@ -7,8 +7,14 @@ _XXX_
 * Pipeline.Rmd:
   Script for importing data from cellranger output, perform filtering and integration
 
+* Pipeline.html:
+  Knit to HTML output of Pipeline.Rmd 
+
 * SourceFunctions.R
   Custom R functions that are required to execute Pipeline.Rmd
+
+* run_souporcell.sh:
+  Code for souporcell analysis
 
 * InputData:
   cellranger and souporcell outputs

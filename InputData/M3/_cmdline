@@ -1,0 +1,1 @@
+cellranger count --id M3 --fastqs ${FASTQ_FOLDER}/M3 --sample M3 --transcriptome ${GENOMES_FOLDER}/refdata-gex-mm10-2020-A --localcores=12 --localmem=64

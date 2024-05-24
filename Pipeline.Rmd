@@ -1,0 +1,923 @@
+---
+title: "scRNA glioma pipeline"
+author: "Stefano de Pretis"
+date: "2024-02-15"
+output: html_document
+---
+
+```{r, echo=FALSE}
+knitr::opts_chunk$set(results = FALSE, message=FALSE, warning=FALSE)
+```
+
+```{r}
+source('SourceFunctions.R')
+```
+
+```{r}
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(Seurat))
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(ggplotify))
+suppressPackageStartupMessages(library(openxlsx))
+suppressPackageStartupMessages(library(patchwork))
+```
+
+# Load data
+
+```{r}
+folders <- c("M2_veh","M16_veh","M3","M4","M2","M12","M5","M6")
+```
+
+
+```{r}
+samples <- lapply(folders,
+       function(project) CreateSeuratObject(
+         Read10X(paste0('InputData/',project,'/outs/filtered_feature_bc_matrix/')), 
+         project = project, min.cells = 3, min.features = 200
+         ))
+names(samples) <- folders
+```
+
+# QC and selecting cells for further analysis
+
+```{r, fig.height = 6, fig.width = 14, echo = FALSE}
+for( s in 1:length(samples) )
+  samples[[s]][["percent.mt"]] <- PercentageFeatureSet(samples[[s]], pattern = "^mt-")
+
+scat_count_mt <- lapply(1:length(samples), function(i) {
+  s <- samples[[i]]
+  s$filter <- c('discarded','selected')[1+1*(s$nFeature_RNA>700)]
+  ggplot(s@meta.data, aes(nFeature_RNA, percent.mt, 
+                          color = filter
+                          )) + 
+    geom_point(size=.2) + # scale_color_viridis() +
+    ggtitle(paste0(names(samples)[i], ' (', length(which(s$nFeature_RNA>700)),' selected cells)')) + 
+    geom_vline(xintercept=700, #linetype="dashed", 
+               color = "red") + 
+    theme_bw() # + theme(legend.position = 'none')
+})
+
+p <- scat_count_mt[[1]]
+for(s in 2:length(samples)) p <- p + (scat_count_mt[[s]])
+p + plot_layout(nrow=2, guides = 'collect')
+
+ggsave('Figures/scatter_nFeature_percent_mt.png', height = 6, width = 14)
+```
+
+```{r, eval=FALSE}
+samples_subset <- lapply(samples, subset, subset = nFeature_RNA > 700)
+saveRDS(samples_subset, file='Data/samples_features_filtered.rds')
+```
+
+```{r}
+##  analyze single samples 
+# samples_subset <- lapply(samples_subset, function(x) {
+#   x <- NormalizeData(x)
+#   x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 4000)
+#   x <- ScaleData(x, features = rownames(x))
+#   x <- RunPCA(x, npcs = 30)
+#   x <- RunUMAP(x, reduction = "pca", dims = 1:20)
+#   x <- FindNeighbors(x, reduction = "pca", dims = 1:20)
+#   x <- FindClusters(x, resolution = .8)
+#   return(x)
+# })
+```
+
+# Batch removal
+
+```{r, eval=FALSE}
+samples_subset <- readRDS(file='Data/samples_features_filtered.rds')
+samples <- lapply(samples, function(x) {
+  # x <- NormalizeData(x) ALREADY NORMALIZED
+  x <- FindVariableFeatures(x, selection.method = "vst", nfeatures = 4000)
+})
+nDims <- 20
+features <- FindIntegrationAnchors(object.list = samples,
+                                   dims = 1:nDims, anchor.features = 4000)
+features.to.integrate = features@anchor.features
+glioma_integrated <- IntegrateData(anchorset = features, dims = 1:nDims,
+                                   features.to.integrate = features.to.integrate)
+DefaultAssay(glioma_integrated) <- "integrated"
+saveRDS(glioma_integrated, file='Data/glioma_features_integrated.rds')
+```
+
+# Standard workflow for visualization and clustering
+
+```{r, eval=FALSE}
+glioma_integrated <- readRDS(file='Data/glioma_features_integrated.rds')
+glioma_integrated <- ScaleData(glioma_integrated, features = rownames(glioma_integrated))
+glioma_integrated <- RunPCA(glioma_integrated, npcs = 30)
+glioma_integrated <- RunUMAP(glioma_integrated, reduction = "pca", dims = 1:20)
+glioma_integrated <- FindNeighbors(glioma_integrated, reduction = "pca", dims = 1:20)
+glioma_integrated <- FindClusters(glioma_integrated, resolution = .8)
+glioma_integrated$orig.ident <- factor(glioma_integrated$orig.ident, levels = c("M2_veh","M16_veh","M3","M4","M2","M12","M5","M6"))
+saveRDS(glioma_integrated, file='Data/glioma_features_integrated_clustered.rds')
+```
+
+# Assignment of cell-types associated with CelliD using PanglaoDB_markers
+
+```{r, eval=FALSE}
+glioma_integrated <- readRDS(
+  file='Data/glioma_features_integrated_clustered.rds')
+# ---------------
+library(CelliD)
+glioma_integrated <- RunMCA(glioma_integrated)
+panglao <- read_tsv("https://panglaodb.se/markers/PanglaoDB_markers_27_Mar_2020.tsv.gz")
+panglao_all <- panglao %>%  filter(str_detect(species,"Mm"))
+panglao_all$`official gene symbol` <- str_to_title(panglao_all$`official gene symbol`)
+panglao_all <- panglao_all %>% group_by(`cell type`) %>% summarise(geneset = list(`official gene symbol`))
+all_gs <- setNames(panglao_all$geneset, panglao_all$`cell type`)
+HGT_panglao_all <- RunCellHGT(glioma_integrated, pathways = all_gs, dims = 1:50)
+HGT_pangall_prediction <- rownames(HGT_panglao_all)[apply(HGT_panglao_all, 2, which.max)]
+HGT_pangall_prediction <- ifelse(apply(HGT_panglao_all, 2, max)>2, yes = HGT_pangall_prediction, "unassigned")
+HGT_pangall_prediction[HGT_pangall_prediction == 'Monocytes'] <- "unassigned"
+glioma_integrated$cellid_panall <- filterLowFreq(HGT_pangall_prediction, 50)
+glioma_integrated$cellid_panall_conf <- apply(HGT_panglao_all, 2, max)
+# Define color palette
+levels <- sort(unique(glioma_integrated$cellid_panall))
+cols_panall <- ggplotColours(length(levels))
+cols_panall[levels=='unassigned'] <- 'grey60'
+cols_panall[levels=='Neurons'] <- 'gold'
+cols_panall[levels=='Macrophages'] <- 'deepskyblue4'
+Misc(glioma_integrated, 'cols_panall') <- cols_panall
+# ---------
+saveRDS(glioma_integrated, file='Data/glioma_features_integrated_clustered_cellid.rds')
+```
+
+# Import Souporcell genotypes 
+
+```{r}
+glioma_integrated <- readRDS(file='Data/glioma_features_integrated_clustered_cellid.rds')
+# -----------
+sorted_samples <- levels(glioma_integrated$orig.ident)
+filenames <- paste0('InputData/', sorted_samples, '/outs/soup_or_cell/clusters.tsv')
+souporcell_all <- lapply(filenames, function(file) {
+  x <- read.table(file, header = T, row.names = 1)
+  tumor_class <- names(which.min(table(x$assignment)[c('0','1')]))
+  x$tumor_assignment <- ifelse(x$assignment == tumor_class, 'tumor', 'normal')
+  return(x)
+  })
+names(souporcell_all) <- sorted_samples
+#------
+for(i in seq(souporcell_all)) rownames(souporcell_all[[i]]) <- 
+  paste(rownames(souporcell_all[[i]]), i, sep = '_')
+names(souporcell_all) <- NULL
+souporcell_merged <- do.call('rbind', souporcell_all)
+glioma_integrated <- AddMetaData(glioma_integrated, souporcell_merged)
+glioma_integrated$tumor_assignment[glioma_integrated$status != 'singlet'] <- NA
+
+# assign the likelihood of being tumor/normal
+
+meta_data <- glioma_integrated@meta.data
+meta_data$tumor_likelihood <- meta_data$normal_likelihood <- NA
+meta_data$normal_likelihood <- meta_data$normal_likelihood <- NA
+meta_data_new <- do.call('rbind', lapply(unique(glioma_integrated$orig.ident), function(s) {
+  sample_meta <- subset(meta_data, orig.ident==s)
+  df <- unique(data.frame(t=sample_meta$tumor_assignment, a=sample_meta$assignment))
+  df <- na.omit(df)
+  sample_meta[[paste(df[1,1], 'likelihood', sep='_')]] <- sample_meta[[paste0('cluster', df[1,2])]]
+  sample_meta[[paste(df[2,1], 'likelihood', sep='_')]] <- sample_meta[[paste0('cluster', df[2,2])]]
+  return(sample_meta)
+}))
+meta_data_new <- meta_data_new[rownames(meta_data),]
+glioma_integrated$tumor_likelihood <- meta_data_new$tumor_likelihood
+glioma_integrated$normal_likelihood <- meta_data_new$normal_likelihood
+glioma_integrated$tumor_assignment[is.na(glioma_integrated$tumor_assignment)] <- 'mixed'
+glioma_integrated$genotype <- glioma_integrated$tumor_assignment
+```
+
+```{r, fig.height=6, fig.width=10}
+orig_idents <- levels(glioma_integrated$orig.ident)
+gg_lik <- ggplot(subset(glioma_integrated@meta.data, orig.ident == orig_idents[1]), 
+       aes(tumor_likelihood, normal_likelihood, color=genotype)) + 
+  geom_point() + geom_abline(slope = 1, linetype='dashed', linewidth=.2) + theme_bw() + scale_color_manual( values = c('mixed' = 'gold', normal='grey80',tumor='grey30')) + ggtitle(orig_idents[1])
+
+for(i in 2:length(orig_idents)) {
+  gg_lik_i <- ggplot(subset(glioma_integrated@meta.data, orig.ident == orig_idents[i]), 
+         aes(tumor_likelihood, normal_likelihood, color=genotype)) + 
+    geom_point() + geom_abline(slope = 1, linetype='dashed', linewidth=.2) + theme_bw() + scale_color_manual( values = c('mixed' = 'gold', normal='grey80',tumor='grey30')) + ggtitle(orig_idents[i])
+  gg_lik <- gg_lik + gg_lik_i
+}
+gg_lik + plot_layout(nrow=2, guides = 'collect')
+
+ggsave('Figures/scatter_nFeature_percent_mt.png', height = 6, width = 15)
+```
+
+
+```{r, fig.height=3, fig.width=10}
+p1 <- DimPlot(glioma_integrated, group.by = 'tumor_assignment') + 
+  scale_color_manual(values = c('mixed' = 'gold', normal='grey80',tumor='grey30'))
+
+p2 <- FeaturePlot(glioma_integrated, 'nFeature_RNA')
+
+p3 <- FeaturePlot(glioma_integrated, 'percent.mt')
+
+p1 + p2 + p3 + plot_layout(nrow = 1)
+
+ggsave('Figures/umap_integrated_clustered.png', height = 3, width = 10)
+```
+
+```{r, eval=FALSE}
+saveRDS(glioma_integrated, 
+file='Data/glioma_features_integrated_clustered_cellid_genotyped.rds')
+```
+
+# remove cells that cluster with the other genotype
+
+```{r, message=TRUE}
+glioma_integrated <- readRDS(
+  file='RerunData/glioma_features_integrated_clustered_cellid_genotyped.rds')
+t_n_clust <- table(glioma_integrated$tumor_assignment, glioma_integrated$seurat_clusters)
+# identify tumor and normal clusters
+t_n_groups <- split(colnames(t_n_clust), rownames(t_n_clust)[apply(t_n_clust,2,which.max)])
+# remove cells that do not map into the cluster of their class
+normal_cluster <- glioma_integrated$seurat_clusters %in% t_n_groups$normal
+normal_cell <- glioma_integrated$tumor_assignment == 'normal'
+normal_cell[glioma_integrated$tumor_assignment == 'mixed'] <- NA
+coherent_cells <- normal_cluster == normal_cell
+message('percentage of mixed genotypes cells:               ', round(100*(length(which(is.na(coherent_cells)))/length(coherent_cells)),1), '%')
+message('percentage of cells with incoherent clustering:    ', round(100*(length(which(!coherent_cells))/length(which(!is.na(coherent_cells)))),1), '%')
+```
+
+
+```{r, eval=FALSE}
+# Run the standard workflow for visualization and clustering
+glioma_integrated_filtered <- glioma_integrated[,coherent_cells]
+glioma_integrated_filtered <- ScaleData(glioma_integrated_filtered, features = rownames(glioma_integrated_filtered))
+glioma_integrated_filtered <- RunPCA(glioma_integrated_filtered, npcs = 30)
+glioma_integrated_filtered <- RunUMAP(glioma_integrated_filtered, reduction = "pca", dims = 1:20)
+glioma_integrated_filtered <- FindNeighbors(glioma_integrated_filtered, reduction = "pca", dims = 1:20)
+glioma_integrated_filtered <- FindClusters(glioma_integrated_filtered, resolution = .8)
+# -------------
+saveRDS(glioma_integrated_filtered, file='Data/glioma_features_integrated_clustered_cellid_genotyped_filtered.rds')
+```
+
+# report
+
+```{r}
+# load the dataset
+glioma_integrated <- readRDS(file='Data/glioma_features_integrated_clustered_cellid_genotyped_filtered.rds')
+# collapse the replicates into their treatment
+glioma_integrated$treatment <- 'untreated'
+glioma_integrated$treatment[glioma_integrated$orig.ident %in% c('M3', 'M4')] <- 'RT'
+glioma_integrated$treatment[glioma_integrated$orig.ident %in% c('M2', 'M12')] <- 'RT+TMZ'
+glioma_integrated$treatment[glioma_integrated$orig.ident %in% c('M5', 'M6')] <- 'RT+TMZ+MET'
+glioma_integrated$treatment <- factor(glioma_integrated$treatment, levels = c('untreated','RT','RT+TMZ','RT+TMZ+MET'))
+```
+
+```{r}
+# # make a palette for treatment
+# treatment_palette <- brewer.pal(4, 'Spectral')
+# names(treatment_palette) <- levels(glioma_integrated$treatment)
+# glioma_integrated@misc$cols_treatment <- treatment_palette
+```
+
+
+```{r}
+# assign the likelihood of being tumor/normal
+meta_data <- glioma_integrated@meta.data
+meta_data$tumor_likelihood <- meta_data$normal_likelihood <- NA
+meta_data$normal_likelihood <- meta_data$normal_likelihood <- NA
+meta_data_new <- do.call('rbind', lapply(unique(glioma_integrated$orig.ident), function(s) {
+  sample_meta <- subset(meta_data, orig.ident==s)
+  df <- unique(data.frame(t=sample_meta$tumor_assignment, a=sample_meta$assignment))
+  sample_meta[[paste(df[1,1], 'likelihood', sep='_')]] <- sample_meta[[paste0('cluster', df[1,2])]]
+  sample_meta[[paste(df[2,1], 'likelihood', sep='_')]] <- sample_meta[[paste0('cluster', df[2,2])]]
+  return(sample_meta)
+}))
+meta_data_new <- meta_data_new[rownames(meta_data),]
+glioma_integrated$tumor_likelihood <- meta_data_new$tumor_likelihood
+glioma_integrated$normal_likelihood <- meta_data_new$normal_likelihood
+# assign first level to tumor (for ggplot coloring reasons)
+glioma_integrated$tumor_assignment <- factor(glioma_integrated$tumor_assignment, levels = c('tumor', 'normal'))
+```
+
+```{r}
+# define cluster colors
+cols_seurat <- c(palette[1:24], palette[1:6])
+names(cols_seurat) <- levels(glioma_integrated$seurat_clusters)
+glioma_integrated@misc$cols_seurat <- cols_seurat
+```
+
+# Genotype analysis
+
+## UMAP
+
+```{r}
+DimPlot(glioma_integrated, group.by = 'tumor_assignment') +
+  scale_color_manual(values = c(normal='grey80',tumor='grey30'))
+ggsave('Figures/umap_filtered_tumor.png', height = 4, width = 4.5)
+```
+
+## likelihood
+
+```{r}
+ggplot(glioma_integrated@meta.data, aes(tumor_likelihood, normal_likelihood, color=tumor_assignment)) + 
+  geom_point() + geom_abline(slope = 1, linetype='dashed', size=.2) + theme_bw() + scale_color_manual(values = c(normal='grey80',tumor='grey30'))
+ggsave('Figures/tumor_likelihood_filtered_cells.png')
+```
+
+## UMAP by treatment
+
+```{r}
+DimPlot(glioma_integrated, group.by = 'tumor_assignment', split.by = 'treatment', ncol=2) + scale_color_manual(values = c(normal='grey80',tumor='grey30'))
+ggsave('Figures/umap_filtered_tumor_splitTreatment.png', height = 7, width = 7)
+```
+
+## barplot
+
+
+```{r}
+glioma_integrated$tumor_assignment <- 
+  factor(glioma_integrated$tumor_assignment, levels = c('tumor', 'normal'))
+treat_tum_table <- table(glioma_integrated$treatment, glioma_integrated$tumor_assignment)
+treat_tum_fract <- t(treat_tum_table/rowSums(treat_tum_table))
+bpOut <- barplot(treat_tum_fract, col = c('grey30','grey80'), 
+                 legend.text = c('tumor', 'normal'), ylim=c(0,1.1), args.legend = list(x='right'))
+text(bpOut, rep(1, length(bpOut)), paste(round(100*treat_tum_fract[1,],1), '%'), pos = 3)
+```
+
+# Cell type identification
+
+## UMAP - Panglao database
+
+```{r, fig.height=5, fig.width=11}
+DimPlot(glioma_integrated, group.by = 'cellid_panall', cols = glioma_integrated@misc$cols_panall) + 
+  FeaturePlot(glioma_integrated, features = 'cellid_panall_conf') + 
+  plot_layout(guides = 'collect')
+ggsave('Figures/umap_filtered_panglao.png', height = 6, width = 12)
+```
+
+# Clustering
+
+## UMAP
+
+```{r}
+DimPlot(glioma_integrated, label = T, cols = glioma_integrated@misc$cols_seurat)
+ggsave('Figures/umap_filtered_clusters.png', height = 4.5, width = 6)
+```
+
+## Divide clusters into groups
+
+```{r}
+tumor_group <- c('5','8','9','10')
+lymphatic_group <- c('1','4','6','16','21','22')
+parenchymal_group <- c('11','13','17','23','25','28','29')
+myeloid <- setdiff(as.character(sort(unique(glioma_integrated$seurat_clusters))),
+                   c(tumor_group, lymphatic_group, parenchymal_group))
+Microglia_group <-  c('0', '2', '7', '3', '12', '15', '18', '20')
+DCs_group  <- c('14', '19', '24', '26', '27')
+all_groups <- c(tumor_group, lymphatic_group, parenchymal_group, 
+  Microglia_group, DCs_group)
+# check that cluster are represented just once
+stopifnot(all(!duplicated(all_groups)))
+# check that all cluster are represented within groups
+stopifnot(length(setdiff(as.character(sort(unique(glioma_integrated$seurat_clusters))), 
+        all_groups)) == 0)
+```
+
+
+```{r}
+cluster_groups <- list(tumor=tumor_group, 
+                       lymphatic=lymphatic_group, 
+                       parenchymal=parenchymal_group, 
+                       myeloid=myeloid)
+                       # MoTAM=MoTAM_group,
+                       # Microglia=Microglia_group,
+                       # DCs=DCs_group)
+                       
+cell_groups <- lapply(cluster_groups, function(k) {
+  colnames(glioma_integrated)[glioma_integrated$seurat_clusters %in% k]
+}); names(cell_groups) <- names(cluster_groups)
+
+glioma_integrated@misc$cols_groups <- c(
+  'tumor'='grey30',
+  'lymphatic'='#19b9c2',
+  'parenchymal'='#c2a019',
+  'myeloid'='#ceb4db'
+  # 'MoTAM'='#ceb4db',
+  # 'Microglia'='#ceb4db',
+  # 'DCs'='#ceb4db'
+)
+
+group1 <- DimPlot(glioma_integrated, cells.highlight = cell_groups[1], 
+                  cols.highlight = 'grey30') + NoLegend() + ggtitle('tumor group')
+group2 <- DimPlot(glioma_integrated, cells.highlight = cell_groups[2], 
+                  cols.highlight = '#19b9c2') + NoLegend() + ggtitle('lymphatic group')
+group3 <- DimPlot(glioma_integrated, cells.highlight = cell_groups[3], 
+                  cols.highlight = '#c2a019') + NoLegend() + ggtitle('parenchymal group') 
+group4 <- DimPlot(glioma_integrated, cells.highlight = cell_groups[4],
+                  cols.highlight = '#ceb4db') + NoLegend() + ggtitle('myeloid group')
+# group4 <- DimPlot(glioma_integrated, cells.highlight = cell_groups[4], 
+#                   cols.highlight = '#ceb4db') + NoLegend() + ggtitle('MoTAM')
+# group5 <- DimPlot(glioma_integrated, cells.highlight = cell_groups[5], 
+#                   cols.highlight = '#ceb4db') + NoLegend() + ggtitle('Microglia')
+# group6 <- DimPlot(glioma_integrated, cells.highlight = cell_groups[6], 
+#                   cols.highlight = '#ceb4db') + NoLegend() + ggtitle('DCs')
+
+group1 + group2 + group3 + group4 # + group5 + group6
+
+ggsave('Figures/umap_filtered_groups.png', height = 7, width = 8)
+```
+
+
+```{r, eval=FALSE}
+# Cluster markers
+All_marker = FindAllMarkers(integrated, assay = 'RNA')
+write.csv(All_marker, "Tables/Cluster_markers.csv")
+```
+
+
+```{r}
+cl_markers <- read.csv('Tables/Cluster_markers.csv', row.names = 1)
+cl_markers <- cl_markers[grep('Hb[ab]-',cl_markers$gene, invert = TRUE),]
+top10_cl_markers <- subset(cl_markers, !grepl('^mt-', rownames(cl_markers))) %>% group_by(cluster) %>% top_n(n = 10, wt = avg_log2FC)
+```
+
+```{r}
+glioma_integrated_RNA <- glioma_integrated
+DefaultAssay(glioma_integrated_RNA) <- 'RNA'
+glioma_integrated_RNA <- ScaleData(glioma_integrated_RNA, features = rownames(glioma_integrated_RNA))
+```
+
+### Heatmap - tumor group
+
+```{r}
+top10_cl_markers_tumor <- subset(top10_cl_markers, cluster %in% tumor_group)$gene
+glioma_tumor_subset <- glioma_integrated_RNA[,
+         glioma_integrated_RNA$seurat_clusters %in% tumor_group]
+```
+
+```{r, fig.height=6, fig.width=6}
+markers_tumor <- 
+  DoAverageHeatmap(object = glioma_tumor_subset, 
+                 features = top10_cl_markers_tumor,  
+                 cluster_rows = F, cluster_cols = F,
+                 gaps_row = seq(0,length(top10_cl_markers_tumor),by=10),
+                 gaps_col = seq(unique(glioma_tumor_subset$seurat_clusters)),
+                 cluster_palette = glioma_integrated@misc$cols_seurat)
+ggsave('Figures/markers_tumor.png', 
+       ggplotify::as.ggplot(markers_tumor$gtable),
+       height = 10, width = 7)
+```
+
+### Heatmap - lymphatic group
+
+```{r, fig.height=13, fig.width=8}
+top10_cl_markers_lymphatic <- subset(top10_cl_markers, cluster %in% lymphatic_group)$gene
+glioma_lymphatic_subset <- glioma_integrated_RNA[,
+         glioma_integrated_RNA$seurat_clusters %in% lymphatic_group]
+```
+
+```{r, fig.height=11, fig.width=6}
+markers_lymphatic <- 
+  DoAverageHeatmap(object = glioma_lymphatic_subset, 
+                 features = top10_cl_markers_lymphatic,  
+                 cluster_rows = F, cluster_cols = F,
+                 gaps_row = seq(0,length(top10_cl_markers_lymphatic),by=10),
+                 gaps_col = seq(unique(glioma_lymphatic_subset$seurat_clusters)),
+                 cluster_palette = glioma_integrated@misc$cols_seurat)
+ggsave('Figures/markers_lymphatic.png', 
+       ggplotify::as.ggplot(markers_lymphatic$gtable),
+       height = 10, width = 7)
+```
+
+### Heatmap - parenchymal group
+
+```{r, fig.height=8, fig.width=6}
+top10_cl_markers_parenchymal <- subset(top10_cl_markers, cluster %in% parenchymal_group)$gene
+glioma_parenchymal_subset <- glioma_integrated_RNA[,
+         glioma_integrated_RNA$seurat_clusters %in% parenchymal_group]
+```
+
+```{r, fig.height=11, fig.width=6}
+markers_parenchyma <- 
+  DoAverageHeatmap(object = glioma_parenchymal_subset, 
+                 features = top10_cl_markers_parenchymal,  
+                 cluster_rows = F, cluster_cols = F,
+                 gaps_row = seq(0,length(top10_cl_markers_parenchymal),by=10),
+                 gaps_col = seq(unique(glioma_parenchymal_subset$seurat_clusters)),
+                 cluster_palette = glioma_integrated@misc$cols_seurat)
+ggsave('Figures/markers_parenchyma.png', 
+       ggplotify::as.ggplot(markers_parenchyma$gtable),
+       height = 10, width = 7)
+```
+
+### Heatmap - myeloid group (Microglia)
+
+```{r, fig.height=11, fig.width=8}
+top10_cl_markers_Microglia<- subset(top10_cl_markers, cluster %in% Microglia_group)$gene
+glioma_Microglia_subset <- glioma_integrated_RNA[,
+         glioma_integrated_RNA$seurat_clusters %in% Microglia_group]
+```
+
+```{r, fig.height=11, fig.width=6}
+markers_microglia <- 
+  DoAverageHeatmap(object = glioma_Microglia_subset, 
+                 features = top10_cl_markers_Microglia,  
+                 cluster_rows = F, cluster_cols = F,
+                 gaps_row = seq(0,length(top10_cl_markers_Microglia),by=10),
+                 gaps_col = seq(unique(glioma_Microglia_subset$seurat_clusters)),
+                 cluster_palette = glioma_integrated@misc$cols_seurat)
+ggsave('Figures/markers_microglia.png', 
+       ggplotify::as.ggplot(markers_microglia$gtable),
+       height = 12, width = 7)
+```
+
+### Heatmap - myeloid group (DCs)
+
+```{r, fig.height=11, fig.width=8}
+top10_cl_markers_DCs<- subset(top10_cl_markers, cluster %in% DCs_group)$gene
+glioma_DCs_subset <- glioma_integrated_RNA[,
+         glioma_integrated_RNA$seurat_clusters %in% DCs_group]
+```
+
+```{r, fig.height=11, fig.width=6}
+markers_DCs <- 
+  DoAverageHeatmap(object = glioma_DCs_subset, 
+                 features = top10_cl_markers_DCs,  
+                 cluster_rows = F, cluster_cols = F,
+                 gaps_row = seq(0,length(top10_cl_markers_DCs),by=10),
+                 gaps_col = seq(unique(glioma_DCs_subset$seurat_clusters)),
+                 cluster_palette = glioma_integrated@misc$cols_seurat)
+ggsave('Figures/markers_DCs.png', 
+       ggplotify::as.ggplot(markers_DCs$gtable),
+       height = 12, width = 7)
+```
+
+## Barplots
+
+### Per group, relative Barplots
+
+```{r, fig.height=7, fig.width=10, message=FALSE}
+library(ggplot2)
+library(ggalluvial)
+
+glioma_myeloid_subset <- glioma_integrated_RNA[,
+         glioma_integrated_RNA$seurat_clusters %in% myeloid]
+
+glioma_subsets <- list(
+  tumor=glioma_tumor_subset, 
+  lymphatic=glioma_lymphatic_subset, 
+  parenchymal=glioma_parenchymal_subset, 
+  myeloid=glioma_myeloid_subset)
+
+relative_plots <- function(seuratObj) {
+  pt <- table(seuratObj$treatment, droplevels(seuratObj$seurat_clusters))
+  pt <- t(as.matrix(pt)/rowSums(pt))
+  pt_df <- as.data.frame(pt)
+  colnames(pt_df)[1:2] <- c('Cluster','Treatment')
+  pt_df$Treatment <- factor(pt_df$Treatment, levels=levels(seuratObj$treatment))
+  
+  alluvial_plot_orig_ident = ggplot(pt_df,aes(x = Treatment, 
+                                              stratum = Cluster, 
+                                              alluvium = Cluster,
+                                              y = Freq,
+                                              fill = Cluster)) +
+    geom_stratum(alpha = 1) +
+    geom_flow(alpha = 0.01) +
+    theme_bw(base_size = 15) +
+    geom_flow(stat = "alluvium", lode.guidance = "forward") +
+    scale_fill_manual(values=seuratObj@misc$cols_seurat[rownames(pt)])
+  
+  alluvial_plot_orig_ident  
+}
+
+rp <- relative_plots(glioma_subsets[[1]])
+for(i in 2:length(glioma_subsets)) {
+  rp <- rp + relative_plots(glioma_subsets[[i]])
+}
+rp
+ggsave('Figures/cluster_abs_frequency.png', 
+       height = 10, width = 12)
+```
+
+### Per group, absolute Barplots
+
+```{r, fig.height=7, fig.width=10, message=FALSE}
+library(ggplot2)
+library(ggalluvial)
+
+glioma_subsets <- list(
+  tumor=glioma_tumor_subset, 
+  lymphatic=glioma_lymphatic_subset, 
+  parenchymal=glioma_parenchymal_subset, 
+  myeloid=glioma_myeloid_subset)
+
+n_cells <- rowSums(table(glioma_integrated$treatment, droplevels(glioma_integrated$seurat_clusters)))
+
+absolute_plots <- function(seuratObj, n_cells) {
+  pt <- table(seuratObj$treatment, droplevels(seuratObj$seurat_clusters))
+  pt <- t(as.matrix(pt)/n_cells)
+  pt_df <- as.data.frame(pt)
+  colnames(pt_df)[1:2] <- c('Cluster','Treatment')
+  pt_df$Treatment <- factor(pt_df$Treatment, levels=levels(seuratObj$treatment))
+  
+  alluvial_plot_orig_ident = ggplot(pt_df,aes(x = Treatment, 
+                                              stratum = Cluster, 
+                                              alluvium = Cluster,
+                                              y = Freq,
+                                              fill = Cluster)) +
+    geom_stratum(alpha = 1) +
+    geom_flow(alpha = 0.01) +
+    theme_bw(base_size = 15) +
+    geom_flow(stat = "alluvium", lode.guidance = "forward") +
+    scale_fill_manual(values=seuratObj@misc$cols_seurat[rownames(pt)])
+  
+  alluvial_plot_orig_ident  
+}
+
+rp <- absolute_plots(glioma_subsets[[1]], n_cells)
+for(i in 2:length(glioma_subsets)) {
+  rp <- rp + absolute_plots(glioma_subsets[[i]], n_cells)
+}
+rp
+ggsave('Figures/cluster_rel_frequency.png', height = 10, width = 12)
+```
+
+```{r}
+glioma_subsets <- list(
+  tumor=glioma_tumor_subset, 
+  lymphatic=glioma_lymphatic_subset, 
+  parenchymal=glioma_parenchymal_subset, 
+  myeloid=glioma_myeloid_subset)
+
+n_cells <- rowSums(table(glioma_integrated$treatment, droplevels(glioma_integrated$seurat_clusters)))
+
+make_prop_table <- function(seuratObj, filename) {
+  
+  pt <- table(seuratObj$treatment, droplevels(seuratObj$seurat_clusters))
+  
+  cell_df <- as.data.frame(pt)
+  colnames(cell_df)[3] <- 'Cells'
+  freq_df <- as.data.frame(as.matrix(pt)/rowSums(pt))
+  colnames(freq_df)[3] <- 'Rel. Freq.'
+  abs <- as.matrix(pt)/n_cells
+  abs_df <- as.data.frame(abs)
+  colnames(abs_df)[3] <- 'Abs. Freq.'
+  
+  csv_df <- merge(cell_df, freq_df)
+  csv_df <- merge(csv_df, abs_df)
+
+  colnames(csv_df)[1:2] <- c('Treatment','Cluster')
+  return(csv_df)
+
+}
+
+openxlsx::write.xlsx(lapply(glioma_subsets, make_prop_table), 
+                   file = 'Tables/proportions_cells_treatments.xlsx')
+```
+
+
+### absolute, per group Barplot
+
+```{r}
+tumor_group <- c('5','8','9','10')
+lymphatic_group <- c('1','4','6','14','16','19','21','22','26','24','27')
+parenchymal_group <- c('11','13','17','23','25','28')
+myeloid <- setdiff(as.character(sort(unique(glioma_integrated$seurat_clusters))), 
+                   c(tumor_group, lymphatic_group, parenchymal_group))
+
+# assign the groups within the main object
+cell_group <- rep('tumor', ncol(glioma_integrated))
+cell_group[glioma_integrated$seurat_clusters %in% lymphatic_group] <- 'lymphatic'
+cell_group[glioma_integrated$seurat_clusters %in% parenchymal_group] <- 'parenchymal'
+cell_group[glioma_integrated$seurat_clusters %in% myeloid] <- 'myeloid'
+glioma_integrated$cell_group <- cell_group
+
+pt <- table(glioma_integrated$treatment, glioma_integrated$cell_group)
+pt <- t(as.matrix(pt)/rowSums(pt))
+pt_df <- as.data.frame(pt)
+colnames(pt_df)[1:2] <- c('Cluster','Treatment')
+pt_df$Treatment <- factor(pt_df$Treatment, levels=levels(glioma_integrated$treatment))
+
+alluvial_plot_orig_ident = ggplot(pt_df,aes(x = Treatment, 
+                                            stratum = Cluster, 
+                                            alluvium = Cluster,
+                                            y = Freq,
+                                            fill = Cluster)) +
+  geom_stratum(alpha = 1) +
+  geom_flow(alpha = 0.01) +
+  theme_bw(base_size = 15) +
+  geom_flow(stat = "alluvium", lode.guidance = "forward") +
+  scale_fill_manual(values=glioma_integrated@misc$cols_groups[rownames(pt)])
+
+alluvial_plot_orig_ident
+ggsave('Figures/groups_abs_frequency.png', 
+       height = 5, width = 7)
+```
+
+# CellCycle
+
+```{r}
+s.genes <- intersect(stringr::str_to_title(cc.genes$s.genes), rownames(glioma_integrated_RNA))
+g2m.genes <- intersect(stringr::str_to_title(cc.genes$g2m.genes), rownames(glioma_integrated_RNA))
+glioma_integrated_RNA <- CellCycleScoring(glioma_integrated_RNA, 
+                                          s.features = s.genes, g2m.features = g2m.genes)
+```
+
+```{r}
+cs1 <- FeaturePlot(glioma_integrated_RNA, features = 'S.Score', max.cutoff = 10, min.cutoff = 0)
+cs2 <- FeaturePlot(glioma_integrated_RNA, features = 'G2M.Score', max.cutoff = 10, min.cutoff = 0)
+cs3 <- DimPlot(glioma_integrated_RNA, group.by = 'Phase')
+```
+
+```{r, fig.height=5, fig.width=10}
+cs1 + cs2 + plot_layout(ncol=2, guides = 'collect')
+ggsave('Figures/umap_filtered_cc_scores.png', 
+       height = 4, width = 8)
+```
+
+```{r}
+cs3
+ggsave('Figures/umap_filtered_cc_phase.png', 
+       height = 4, width = 4.5)
+```
+
+```{r, fig.height=8, fig.width=8}
+DimPlot(glioma_integrated_RNA, group.by = 'Phase', split.by = 'treatment', ncol=2)
+ggsave('Figures/umap_filtered_cc_phase_splitTreatment.png', 
+       height = 8, width = 9)
+```
+
+```{r, fig.height=7, fig.width=10}
+library(ggplot2)
+library(ggalluvial)
+
+#--- tumor genotype
+pt <- with(subset(glioma_integrated@meta.data, tumor_assignment=='tumor'), table(treatment, Phase))
+pt <- t(as.matrix(pt)/rowSums(pt))
+pt_df <- as.data.frame(pt)
+colnames(pt_df)[1:2] <- c('Phase','Treatment')
+pt_df$Treatment <- factor(pt_df$Treatment, levels=levels(glioma_integrated$treatment))
+
+alluvial_plot_tumor_cells = ggplot(pt_df,aes(x = Treatment, stratum = Phase, alluvium = Phase,
+              y = Freq,
+              fill = Phase)) +
+  geom_stratum(alpha = 1) +
+  geom_flow(alpha = 0.01) +
+  theme_bw(base_size = 15) +
+  geom_flow(stat = "alluvium", lode.guidance = "forward") + ggtitle('tumor')
+
+#--- normal genotype
+pt <- with(subset(glioma_integrated@meta.data, tumor_assignment=='normal'), table(treatment, Phase))
+pt <- t(as.matrix(pt)/rowSums(pt))
+pt_df <- as.data.frame(pt)
+colnames(pt_df)[1:2] <- c('Phase','Treatment')
+pt_df$Treatment <- factor(pt_df$Treatment, levels=levels(glioma_integrated$treatment))
+
+alluvial_plot_normal_cells = ggplot(pt_df,aes(x = Treatment, stratum = Phase, alluvium = Phase,
+              y = Freq,
+              fill = Phase)) +
+  geom_stratum(alpha = 1) +
+  geom_flow(alpha = 0.01) +
+  theme_bw(base_size = 15) +
+  geom_flow(stat = "alluvium", lode.guidance = "forward") + ggtitle('normal')
+
+#--- all genotype
+pt <- with(glioma_integrated@meta.data, table(treatment, Phase))
+pt <- t(as.matrix(pt)/rowSums(pt))
+pt_df <- as.data.frame(pt)
+colnames(pt_df)[1:2] <- c('Phase','Treatment')
+pt_df$Treatment <- factor(pt_df$Treatment, levels=levels(glioma_integrated$treatment))
+
+alluvial_plot_all_cells = ggplot(pt_df,aes(x = Treatment, stratum = Phase, alluvium = Phase,
+              y = Freq,
+              fill = Phase)) +
+  geom_stratum(alpha = 1) +
+  geom_flow(alpha = 0.01) +
+  theme_bw(base_size = 15) +
+  geom_flow(stat = "alluvium", lode.guidance = "forward") + ggtitle('all')
+
+alluvial_plot_tumor_cells + alluvial_plot_normal_cells + alluvial_plot_all_cells + 
+  plot_layout(guides = 'collect')
+ggsave('Figures/cc_phase_abs_frequency.png',
+       height = 5, width = 14)
+```
+
+
+# Gene lists
+
+## Classification genes 
+
+```{r}
+gene_list <- c("Gfap","Itgam","Itgax","Tmem119","Cx3cr1","Scin","P2ry12","Sall1","Slc2a5","Ly6c1","Ccr2","Ptprc","Itga2","Cd3g","Cd4","Cd8a","Il2ra","Adgre1","Cd68","Foxp3","Pdcd1","Cd274","Pdcd1lg2","Lag3")
+```
+
+```{r}
+# cluster_groups
+# glioma_integrated@misc$cols_groups
+```
+
+```{r}
+view_out <- viewGeneList(gene_list, 
+                         groups_order = c('lymphatic','myeloid','parenchymal','tumor'),
+                         ncol = 3)
+```
+
+```{r, fig.height=1+length(view_out$avg_heat$tree_row$labels), fig.width=12}
+view_out$fp
+ggsave('Figures/features_classification.png', 
+       height = 1+length(view_out$avg_heat$tree_row$labels), 
+       width = 12)
+```
+
+```{r, fig.height=1+length(view_out$avg_heat$tree_row$labels)/3, fig.width=10}
+as.ggplot(view_out$avg_heat_by_group)
+ggsave('Figures/heatmap_classification.png',
+       height = 1+length(view_out$avg_heat$tree_row$labels)/3,
+       width = 10
+       )
+```
+
+## TAMs_M1
+
+```{r}
+gene_list <- c(
+'Fcgr3a', # CD16  TAMs_M1
+'Cd86', # TAMs_M1
+'Il12a', # IL-12 TAMs_M1
+'Tnf', # TNF-α TAMs_M1
+'Ifng', # IFN-γ TAMs_M1
+'Nos2')
+```
+
+```{r}
+view_out <- viewGeneList(gene_list, ncol = 3)
+```
+
+```{r, fig.height=1+length(view_out$avg_heat$tree_row$labels), fig.width=12}
+view_out$fp
+ggsave('Figures/features_TAMs_M1.png',
+       height = 1+length(view_out$avg_heat$tree_row$labels),
+       width = 12)
+```
+
+```{r, fig.height=1+length(view_out$avg_heat$tree_row$labels)/3, fig.width=10}
+as.ggplot(view_out$avg_heat_by_group)
+ggsave('Figures/heatmap_TAMs_M1.png',
+       height = 1+length(view_out$avg_heat$tree_row$labels)/3,
+       width = 10)
+```
+
+## TAMs_M2
+
+```{r}
+gene_list <- c('Mrc1', # CD206(q)   TAMs_M2
+'Il4', # IL-4  TAMs_M2
+'Cxcl8', # IL-8  TAMs_M2
+'Il10', # IL-10 TAMs_M2
+'Il13', # IL-13 TAMs_M2
+'Tgfb1', # TGF-β TAMs_M2
+'Arg1') # Arg-1 TAMs_M2
+```
+
+```{r}
+view_out <- viewGeneList(gene_list, ncol = 3)
+```
+
+```{r, fig.height=1+length(view_out$avg_heat$tree_row$labels), fig.width=12}
+view_out$fp
+ggsave('Figures/features_TAMs_M2.png',
+       height=1+length(view_out$avg_heat$tree_row$labels), 
+       width=12
+       )
+```
+
+```{r, fig.height=1+length(view_out$avg_heat$tree_row$labels)/3, fig.width=10}
+as.ggplot(view_out$avg_heat_by_group)
+ggsave('Figures/heatmap_TAMs_M2.png',
+       height=1+length(view_out$avg_heat$tree_row$labels)/3, 
+       width=10
+       )
+```
+
+## Tumor response
+
+```{r}
+gene_list <- intersect(c('Trem2','Tspo','Fap','Cxcr4'), rownames(glioma_integrated_RNA))
+```
+
+```{r}
+view_out <- viewGeneList(gene_list, ncol = 3)
+```
+
+```{r, fig.height=1+length(view_out$avg_heat$tree_row$labels), fig.width=12}
+view_out$fp
+ggsave('Figures/features_tumor.png', 
+       height=1+length(view_out$avg_heat$tree_row$labels), 
+       width=12)
+```
+
+```{r, fig.height=1+length(view_out$avg_heat$tree_row$labels)/3, fig.width=10}
+as.ggplot(view_out$avg_heat_by_group)
+ggsave('Figures/heatmap_tumor.png',
+       height=1+length(view_out$avg_heat$tree_row$labels)/3, 
+       width=10
+       )
+```
+
+
+
+
+
