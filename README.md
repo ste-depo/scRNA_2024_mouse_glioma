@@ -17,7 +17,7 @@ _XXX_
   Code for souporcell analysis
 
 * InputData:
-  cellranger and souporcell outputs
+  cellranger outputs (empty, they should be filled GSE256358 processed data) and souporcell outputs
 
 * Figures:
   figures that the script can produce
